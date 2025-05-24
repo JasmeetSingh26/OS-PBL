@@ -7,7 +7,9 @@
 #include <sys/types.h>
 #include <openssl/evp.h>
 
-#define PORT 8080 // port for communication
+#define PORT 5001 // port for communication
+#define SMALL_FILE_THRESHOLD (1 * 1024 * 1024)     // 1MB
+#define MEDIUM_FILE_THRESHOLD (100 * 1024 * 1024)  // 100MB
 
 /*
  this function calculates the hash for the newly created file using SHA-256.
@@ -90,15 +92,14 @@ void* receive_file_segment(void* arg) {
     FILE* file = thread_arg->file;
     char buffer[1024];
     ssize_t bytes_received;
-    pthread_mutex_lock(&mtx);
+    
     while ((bytes_received = recv(socket, buffer, sizeof(buffer), 0)) > 0) {
-        // lock only around the critical section
-        fwrite(buffer, 1, bytes_received, file);
-        pthread_mutex_unlock(&mtx);
-        printf("received: %s\n", buffer);
         pthread_mutex_lock(&mtx);
+        fwrite(buffer, 1, bytes_received, file);
+        fflush(file);  // Ensure data is written to disk
+        pthread_mutex_unlock(&mtx);
     }
-    pthread_mutex_unlock(&mtx);
+
     if (bytes_received < 0) {
         perror("could not receive bytes");
     }
@@ -111,13 +112,13 @@ The connection with the server is established in the main, data integrity checks
 implemented here
 */
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Please enter two command line arguments.\n");
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
         return -1;
     }
 
     char* file_name = argv[1];
-    int num_threads = atoi(argv[2]);
+    int num_threads;
 
     // local host IP address
     char* server_ip = "127.0.0.1";
@@ -146,10 +147,16 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // send the command line arguments to the server
+    // send the file name to server
     send(client_fd, file_name, strlen(file_name) + 1, 0);
-    printf("Client: Sending num_threads = %d\n", num_threads); // debug
-    send(client_fd, &num_threads, sizeof(num_threads), 0);
+    
+    // receive the optimal thread count from server
+    if (recv(client_fd, &num_threads, sizeof(num_threads), 0) <= 0) {
+        perror("Failed to receive thread count from server");
+        close(client_fd);
+        return -1;
+    }
+    printf("Server determined optimal thread count: %d\n", num_threads);
 
     unsigned char server_hash[EVP_MAX_MD_SIZE];
     recv(client_fd, server_hash, 32, 0);
