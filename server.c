@@ -10,7 +10,10 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
-#define PORT 8080 // port for communication
+#define PORT 5001 // port for communication
+#define SMALL_FILE_THRESHOLD (1 * 1024 * 1024)     // 1MB
+#define MEDIUM_FILE_THRESHOLD (100 * 1024 * 1024)  // 100MB
+#define MIN_SEGMENT_SIZE (64 * 1024)               // 64KB minimum segment size
 
 typedef struct {
     int socket;
@@ -85,6 +88,30 @@ void calculate_hash(char* file_name, unsigned char* hash_out, unsigned int* hash
     EVP_MD_CTX_free(mdctx);
 }
 
+// Function to determine optimal thread count based on file size and system resources
+int calculate_optimal_threads(long file_size) {
+    // Get number of CPU cores
+    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cores <= 0) num_cores = 2; // Default if can't determine
+
+    // For very small files, use single thread
+    if (file_size < SMALL_FILE_THRESHOLD) {
+        return 1;
+    }
+
+    // Calculate theoretical max threads based on minimum segment size
+    int max_threads_by_size = file_size / MIN_SEGMENT_SIZE;
+    if (max_threads_by_size <= 0) max_threads_by_size = 1;
+
+    // For medium files, use number of cores
+    if (file_size < MEDIUM_FILE_THRESHOLD) {
+        return (num_cores < max_threads_by_size) ? num_cores : max_threads_by_size;
+    }
+
+    // For large files, use 2x number of cores
+    int optimal_threads = num_cores * 2;
+    return (optimal_threads < max_threads_by_size) ? optimal_threads : max_threads_by_size;
+}
 
 void* send_file_segment(void* arg) {
     threadArgument* thread_arg = (threadArgument*)arg;
@@ -152,7 +179,7 @@ int main(int argc, char* argv[]) {
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
 
-    // creatign TCP socket
+    // creating TCP socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("Could not create the socket.");
         exit(EXIT_FAILURE);
@@ -188,23 +215,15 @@ int main(int argc, char* argv[]) {
 
         printf("Connection established with client.\n");
 
-        // receive file name and thread count from client
+        // receive file name from client
         char file_name[256] = {0};
-        int num_threads;
-        // recv(client_socket, file_name, sizeof(file_name), 0);
         if (recv(client_socket, file_name, sizeof(file_name), 0) <= 0) {
             perror("Failed to receive file name");
             close(client_socket);
-            return 1;
-        }
-        if (recv(client_socket, &num_threads, sizeof(num_threads), 0) <= 0) {
-            perror("Failed to receive number of threads");
-            close(client_socket);
-            return 1;
+            continue;
         }
         
-        printf("Requested file: %s, Number of threads: %d\n", file_name, num_threads);
-
+        // Open file and get its size
         FILE* file = fopen(file_name, "rb");
         if (file == NULL) {
             perror("File not found");
@@ -212,7 +231,20 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // calcualte hash and share with the client for comparison
+        // Get file size
+        fseek(file, 0, SEEK_END);
+        long file_size = ftell(file);
+        fclose(file);
+
+        // Calculate optimal number of threads
+        int num_threads = calculate_optimal_threads(file_size);
+        printf("File size: %ld bytes, Automatically determined thread count: %d\n", file_size, num_threads);
+
+        // Send the number of threads to client
+        send(client_socket, &num_threads, sizeof(num_threads), 0);
+
+        file = fopen(file_name, "rb");
+        // calculate hash and share with the client for comparison
         unsigned char file_hash[32];
         unsigned int hash_len = 0;
         calculate_hash(file_name, file_hash, &hash_len);
@@ -227,15 +259,10 @@ int main(int argc, char* argv[]) {
         }
         printf("\n");
 
-        // find the file size
-        fseek(file, 0, SEEK_END);
-        long file_size = ftell(file);
-        fclose(file);
-
         // calculate the segment size
         float x = (float)file_size / (float)num_threads;
         long segment_size = ceil(x);
-        printf("file size: %ld, segment size: %ld\n", file_size, segment_size);
+        printf("Segment size: %ld bytes\n", segment_size);
 
         pthread_t threads[num_threads];
         threadArgument thread_args[num_threads];
@@ -245,9 +272,8 @@ int main(int argc, char* argv[]) {
             thread_args[i].socket = client_socket;
             thread_args[i].file_name = file_name;
             thread_args[i].start_byte = i * segment_size;
-            // condition to avoid seg fault
             thread_args[i].end_byte = (i == num_threads - 1) ? file_size - 1 : (i + 1) * segment_size - 1;
-            printf("start: %ld, end: %ld\n", thread_args[i].start_byte, thread_args[i].end_byte);
+            printf("Thread %d: [%ld - %ld]\n", i, thread_args[i].start_byte, thread_args[i].end_byte);
             pthread_create(&threads[i], NULL, send_file_segment, &thread_args[i]);
         }
 
